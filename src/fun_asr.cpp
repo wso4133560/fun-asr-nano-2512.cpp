@@ -804,7 +804,7 @@ static ggml_cgraph * build_encoder_graph(
         const float scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor * mha = ggml_flash_attn_ext(gctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
         // Output: [head_dim, T, n_heads] → permute(0,2,1) → [head_dim, n_heads, T] → reshape to [512, T]
-        mha = ggml_cont(gctx, ggml_permute(gctx, mha, 2, 0, 1, 3));
+        // FA output: [head_dim, n_heads, T] — direct reshape to [n_heads*head_dim, T]
         mha = ggml_reshape_2d(gctx, mha, FUN_ASR_ENC_DIM, T);
 
         // FSMN on V (raw V before permute for attention), then residual internally
@@ -830,8 +830,8 @@ static ggml_cgraph * build_encoder_graph(
         ffn = ggml_add(gctx, ffn, e32(gctx, L.ffn_b2));
 
         x = ggml_add(gctx, h_attn, ffn);
-        ggml_set_name(x, "dbg_blk0");
     }
+
 
     // blk.1..49 (dim=512)
     for (int i = 1; i < FUN_ASR_ENC_LAYERS; i++) {
@@ -859,7 +859,7 @@ static ggml_cgraph * build_encoder_graph(
 
         const float scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor * mha = ggml_flash_attn_ext(gctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-        mha = ggml_cont(gctx, ggml_permute(gctx, mha, 2, 0, 1, 3));
+        // FA output: [head_dim, n_heads, T] — direct reshape to [n_heads*head_dim, T]
         mha = ggml_reshape_2d(gctx, mha, FUN_ASR_ENC_DIM, T);
 
         ggml_tensor * V_raw = ggml_cont(gctx, ggml_view_2d(gctx, qkv, FUN_ASR_ENC_DIM, T,
@@ -913,7 +913,7 @@ static ggml_cgraph * build_encoder_graph(
 
         const float scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor * mha = ggml_flash_attn_ext(gctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-        mha = ggml_cont(gctx, ggml_permute(gctx, mha, 2, 0, 1, 3));
+        // FA output: [head_dim, n_heads, T] — direct reshape to [n_heads*head_dim, T]
         mha = ggml_reshape_2d(gctx, mha, FUN_ASR_ENC_DIM, T);
 
         // FSMN on raw V, linear_out(mha) + fsmn(V)
@@ -1004,7 +1004,7 @@ static ggml_cgraph * build_projector_graph(
         // Global attention (no mask, no RoPE)
         const float scale = 1.0f / sqrtf((float)ada_head_dim);
         ggml_tensor * attn = ggml_flash_attn_ext(gctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-        attn = ggml_cont(gctx, ggml_permute(gctx, attn, 2, 0, 1, 3));
+        // FA output: [head_dim, n_heads, T] — direct reshape
         attn = ggml_reshape_2d(gctx, attn, ada_dim, T);
 
         // Output projection
@@ -1341,7 +1341,7 @@ static ggml_tensor * build_qwen3_layer(
 
     const float scale = 1.0f / sqrtf((float)head_dim);
     ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask, scale, 0.0f, 0.0f);
-    attn_out = ggml_cont(gctx, ggml_permute(gctx, attn_out, 2, 0, 1, 3));
+    // FA output: [head_dim, n_heads, n_tokens] — direct reshape
     attn_out = ggml_reshape_2d(gctx, attn_out, n_q_heads * head_dim, n_tokens);
 
     // Output projection + residual
@@ -1398,19 +1398,11 @@ static bool run_encoder(fun_asr_ctx * ctx, const float * lfr_data, int32_t T) {
         ggml_free(gctx); return false;
     }
 
-    // Upload input: lfr_data is [T, 560] row-major, need [560, T] column-major
-    // The tensor inp in the graph is [560, T] (ne[0]=560, ne[1]=T)
-    // We transpose on upload
+    // Upload input: lfr_data is [T, 560] row-major
+    // GGML tensor [560, T]: ne[0]=560 is contiguous — same layout as row-major [T, 560]
     ggml_tensor * inp = ggml_graph_get_tensor(gf, "enc_input");
     if (inp) {
-        // Transpose: lfr_data[t, d] → inp[d, t]
-        std::vector<float> transposed((size_t)FUN_ASR_ENC_INPUT_DIM * T);
-        for (int t = 0; t < T; t++) {
-            for (int d = 0; d < FUN_ASR_ENC_INPUT_DIM; d++) {
-                transposed[d * T + t] = lfr_data[t * FUN_ASR_ENC_INPUT_DIM + d];
-            }
-        }
-        ggml_backend_tensor_set(inp, transposed.data(), 0,
+        ggml_backend_tensor_set(inp, lfr_data, 0,
             (size_t)FUN_ASR_ENC_INPUT_DIM * T * sizeof(float));
     }
 
