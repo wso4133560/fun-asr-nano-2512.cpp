@@ -53,9 +53,22 @@ cmake --build build -j$(nproc)
     --ctc-model-dir /path/to/ctc_model
 ```
 
-## 模型文件
+## 模型下载
+
+```bash
+# 默认下载 Q5_K_M（推荐）
+bash tools/download_models.sh
+
+# 指定量化版本和输出目录
+bash tools/download_models.sh --quant Q4_K_M --dir /path/to/models
+```
+
+可选量化：`F16` / `Q4_K_M` / `Q5_K_M`（默认）。
+模型来源：[HuggingFace wso4133560freewind/Fun-ASR-Nano-2512-gguf](https://huggingface.co/wso4133560freewind/Fun-ASR-Nano-2512-gguf)
 
 | 文件 | 说明 |
 |------|------|
-| `Fun-ASR-Nano-2512-llm-Q5_K_M.gguf` | Qwen3-0.6B 解码器 |
+| `Fun-ASR-Nano-2512-llm-Q5_K_M.gguf` | Qwen3-0.6B 解码器（推荐） |
+| `Fun-ASR-Nano-2512-llm-Q4_K_M.gguf` | Qwen3-0.6B 解码器（更小） |
+| `Fun-ASR-Nano-2512-llm-F16.gguf` | Qwen3-0.6B 解码器（全精度） |
 | `Fun-ASR-Nano-2512-audio-mmproj-mtmd-F16.gguf` | SenseVoice 编码器 + MLP 投影 + Adaptor |
