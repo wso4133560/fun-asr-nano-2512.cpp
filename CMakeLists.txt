@@ -92,5 +92,10 @@ if(FUN_ASR_NATIVE_OPT AND NOT MSVC)
     target_compile_options(fun_asr_lib PRIVATE -march=native -mtune=native)
 endif()
 
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(fun_asr_lib PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 add_executable(fun-asr-nano src/main.cpp)
 target_link_libraries(fun-asr-nano PRIVATE fun_asr_lib)

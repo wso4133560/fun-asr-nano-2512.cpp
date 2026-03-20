@@ -7,14 +7,18 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <numeric>
+#include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ============================================================================
@@ -23,17 +27,72 @@
 
 static constexpr float PI = 3.14159265358979323846f;
 static constexpr int32_t N_FFT       = FUN_ASR_FRAME_LEN;      // 400
-static constexpr int32_t N_FFT_PAD   = 512;                     // next power of 2
-static constexpr int32_t N_FREQ      = N_FFT_PAD / 2 + 1;      // 257 (kaldi uses padded FFT size)
+static constexpr int32_t N_FREQ      = N_FFT / 2 + 1;           // 201 (matches torchaudio rfft n=400)
 static constexpr float   MEL_LOW_HZ  = 20.0f;
 static constexpr float   MEL_HIGH_HZ = 8000.0f; // kaldi nyquist
 static constexpr int32_t MAX_ENC_SEQ = FUN_ASR_MAX_ENC_SEQ;    // 3000 (raw LFR frames)
+static constexpr int32_t FUN_ASR_LLM_STOP_TOKEN = 151643;
 
-static constexpr const char* PROMPT_PREFIX =
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-    "\xe8\xaf\xad\xe9\x9f\xb3\xe8\xbd\xac\xe5\x86\x99\xef\xbc\x9a"; // 语音转写：
-static constexpr const char* PROMPT_SUFFIX =
-    "<|im_end|>\n<|im_start|>assistant\n";
+static std::string to_ascii_lower(std::string s) {
+    for (char & ch : s) {
+        ch = (char)std::tolower((unsigned char)ch);
+    }
+    return s;
+}
+
+static std::string canonical_language_hint(const std::string & raw) {
+    if (raw.empty()) return "";
+
+    const std::string lower = to_ascii_lower(raw);
+    if (lower == "zh" || lower == "zh-cn" || lower == "cn" || lower == "chinese") return "中文";
+    if (lower == "en" || lower == "en-us" || lower == "en-gb" || lower == "english") return "英文";
+    if (lower == "ja" || lower == "jp" || lower == "ja-jp" || lower == "japanese") return "日语";
+    if (lower == "yue" || lower == "cantonese") return "粤语";
+    if (lower == "ko" || lower == "korean") return "韩文";
+    return raw;
+}
+
+static std::string canonical_task_hint(const std::string & raw) {
+    if (raw.empty()) return "";
+
+    const std::string lower = to_ascii_lower(raw);
+    if (lower == "transcribe" || lower == "transcription" || lower == "asr" || lower == "recognize") {
+        return "语音转写";
+    }
+    if (lower == "translate" || lower == "translation") {
+        return "语音翻译";
+    }
+    return raw;
+}
+
+static std::string build_prompt_suffix(const fun_asr_decode_options * options) {
+    std::string suffix = "<|endofspeech|>\n";
+    if (options) {
+        const std::string language = canonical_language_hint(options->language);
+        const std::string task     = canonical_task_hint(options->task);
+        if (!task.empty()) {
+            suffix += "任务：" + task + "\n";
+        }
+        if (!language.empty()) {
+            suffix += "目标语言：" + language + "\n";
+        }
+        if (!options->context.empty()) {
+            suffix += "上下文信息：" + options->context + "\n";
+        }
+        if (!options->ctc_text.empty()) {
+            suffix += "参考转写：" + options->ctc_text + "\n";
+        }
+    }
+    suffix += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    return suffix;
+}
+
+static std::string build_prompt_prefix(const fun_asr_decode_options * options) {
+    (void) options;
+    return
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n<|startofspeech|>";
+}
 
 // ============================================================================
 // Internal weight structures
@@ -500,144 +559,132 @@ static float mel_to_hz(float mel) {
     return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f);
 }
 
-// FFT state (radix-2, zero-padded to N_FFT_PAD=512)
-struct FFTPlan {
-    std::vector<uint32_t> bit_rev;
-    std::vector<float>    tw_re, tw_im;
+// Pre-compute windowed DFT basis: hamming[n] * exp(-j2πkn/N) for 400-point rfft → 201 bins.
+// Baking the window into the basis turns the per-frame inner loop into a pure dot product
+// that auto-vectorizes well with SSE/AVX.
+struct DFTPlan {
+    // wcos[k * N_FFT + n] = hamming[n] * cos(2πkn/N)
+    // wsin[k * N_FFT + n] = hamming[n] * sin(2πkn/N)
+    std::vector<float> wcos; // [N_FREQ * N_FFT]
+    std::vector<float> wsin;
 };
 
-static const FFTPlan & get_fft_plan() {
-    static FFTPlan plan = [] {
-        FFTPlan p;
-        const int N = N_FFT_PAD;
-        const int log2N = __builtin_ctz((uint32_t)N);
-        p.bit_rev.resize(N);
-        for (int i = 0; i < N; i++) {
-            uint32_t rev = 0, val = i;
-            for (int b = 0; b < log2N; b++) { rev = (rev << 1) | (val & 1); val >>= 1; }
-            p.bit_rev[i] = rev;
+static const DFTPlan & get_dft_plan() {
+    static DFTPlan plan = [] {
+        DFTPlan p;
+        // Periodic Hamming window (torchaudio periodic=True: /N not /(N-1))
+        std::vector<float> hamming(N_FFT);
+        for (int n = 0; n < N_FFT; n++) {
+            hamming[n] = 0.54f - 0.46f * cosf(2.0f * PI * n / N_FFT);
         }
-        p.tw_re.resize(N / 2);
-        p.tw_im.resize(N / 2);
-        for (int i = 0; i < N / 2; i++) {
-            const float a = -2.0f * PI * i / N;
-            p.tw_re[i] = cosf(a);
-            p.tw_im[i] = sinf(a);
+        p.wcos.resize((size_t)N_FREQ * N_FFT);
+        p.wsin.resize((size_t)N_FREQ * N_FFT);
+        for (int k = 0; k < N_FREQ; k++) {
+            for (int n = 0; n < N_FFT; n++) {
+                const float angle = 2.0f * PI * k * n / N_FFT;
+                p.wcos[k * N_FFT + n] = hamming[n] * cosf(angle);
+                p.wsin[k * N_FFT + n] = hamming[n] * sinf(angle);
+            }
         }
         return p;
     }();
     return plan;
 }
 
-static void fft_radix2(float * re, float * im, const FFTPlan & plan) {
-    const int N = N_FFT_PAD;
-    const int log2N = __builtin_ctz((uint32_t)N);
-    for (int i = 0; i < N; i++) {
-        int j = (int)plan.bit_rev[i];
-        if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
-    }
-    for (int s = 1; s <= log2N; s++) {
-        int m = 1 << s, half = m >> 1, step = N / m;
-        for (int k = 0; k < N; k += m) {
-            for (int j = 0; j < half; j++) {
-                float wr = plan.tw_re[j * step], wi = plan.tw_im[j * step];
-                float tr = wr * re[k+j+half] - wi * im[k+j+half];
-                float ti = wr * im[k+j+half] + wi * re[k+j+half];
-                re[k+j+half] = re[k+j] - tr; im[k+j+half] = im[k+j] - ti;
-                re[k+j] += tr; im[k+j] += ti;
-            }
-        }
-    }
-}
-
-// Compute mel filterbank features
+// Compute mel filterbank features (matches torchaudio/FunASR Python pipeline)
 // Input: audio [n_samples] (already upscaled ×32768)
-// Output: fbank [n_mel, n_frames] stored as mel-major (row = mel bin)
+// Output: fbank [n_frames, n_mel] (frame-major)
 static void compute_fbank(
     const std::vector<float> & audio,
     std::vector<float>       & fbank_out,
     int32_t                  * out_frames)
 {
-    const int32_t n_samples  = (int32_t)audio.size();
-    const int32_t frame_len  = FUN_ASR_FRAME_LEN;  // 400
-    const int32_t frame_shift = FUN_ASR_FRAME_SHIFT; // 160
-    const int32_t n_mel      = FUN_ASR_NUM_MEL_BINS; // 80
-    const int32_t n_freq     = N_FREQ;               // 201
+    const int32_t n_samples   = (int32_t)audio.size();
+    const int32_t frame_len   = FUN_ASR_FRAME_LEN;   // 400
+    const int32_t frame_shift = FUN_ASR_FRAME_SHIFT;  // 160
+    const int32_t n_mel       = FUN_ASR_NUM_MEL_BINS; // 80
+    const int32_t n_freq      = N_FREQ;               // 201
+    const int32_t half_n_fft  = frame_len / 2;        // 200
 
-    // snip_edges=True: n_frames = floor((n_samples - frame_len) / frame_shift) + 1
-    const int32_t n_frames = (n_samples >= frame_len)
-        ? (n_samples - frame_len) / frame_shift + 1 : 0;
+    // Global mean subtraction (matches Python: audio = audio - np.mean(audio))
+    float global_mean = 0.0f;
+    for (int i = 0; i < n_samples; i++) global_mean += audio[i];
+    global_mean /= n_samples;
+
+    // Global pre-emphasis (matches Python: audio[1:] - 0.97 * audio[:-1])
+    std::vector<float> audio_pe(n_samples);
+    audio_pe[0] = audio[0] - global_mean;
+    for (int i = 1; i < n_samples; i++) {
+        audio_pe[i] = (audio[i] - global_mean) - 0.97f * (audio[i - 1] - global_mean);
+    }
+
+    // Center padding: pad half_n_fft zeros on each side (matches torchaudio center=True)
+    const int32_t padded_len = half_n_fft + n_samples + half_n_fft;
+    std::vector<float> padded(padded_len, 0.0f);
+    std::copy(audio_pe.begin(), audio_pe.end(), padded.begin() + half_n_fft);
+
+    // Frame count with center padding
+    const int32_t n_frames = 1 + (padded_len - frame_len) / frame_shift;
     *out_frames = n_frames;
     if (n_frames == 0) return;
 
-    // Pre-compute Hamming window
-    std::vector<float> hamming(frame_len);
-    for (int i = 0; i < frame_len; i++) {
-        hamming[i] = 0.54f - 0.46f * cosf(2.0f * PI * i / (frame_len - 1));
-    }
-
-    // Pre-compute HTK mel filters: filters[k * n_mel + m] = weight for FFT bin k, mel m
+    // Mel filterbank (matches torchaudio: linspace(0, sr//2, n_fft//2+1))
     std::vector<float> mel_filters(n_freq * n_mel, 0.0f);
     {
+        std::vector<float> all_freqs(n_freq);
+        for (int k = 0; k < n_freq; k++) {
+            all_freqs[k] = (float)k * (float)(FUN_ASR_SAMPLE_RATE / 2) / (n_freq - 1);
+        }
         const float low_mel  = hz_to_mel(MEL_LOW_HZ);
         const float high_mel = hz_to_mel(MEL_HIGH_HZ);
-        const float fft_res  = (float)FUN_ASR_SAMPLE_RATE / (2.0f * (n_freq - 1)); // Hz per bin
-
-        std::vector<float> mel_pts(n_mel + 2), hz_pts(n_mel + 2);
+        std::vector<float> f_pts(n_mel + 2);
         for (int m = 0; m <= n_mel + 1; m++) {
-            mel_pts[m] = low_mel + (high_mel - low_mel) * m / (n_mel + 1);
-            hz_pts[m]  = mel_to_hz(mel_pts[m]);
+            float mel_m = low_mel + (high_mel - low_mel) * m / (n_mel + 1);
+            f_pts[m] = mel_to_hz(mel_m);
         }
+        std::vector<float> f_diff(n_mel + 1);
+        for (int m = 0; m < n_mel + 1; m++) f_diff[m] = f_pts[m + 1] - f_pts[m];
         for (int m = 0; m < n_mel; m++) {
-            float fl = hz_pts[m], fc = hz_pts[m+1], fr = hz_pts[m+2];
             for (int k = 0; k < n_freq; k++) {
-                float f = k * fft_res;
-                float v = 0.0f;
-                if (f > fl && f < fc)       v = (f - fl) / (fc - fl);
-                else if (f >= fc && f < fr) v = (fr - f) / (fr - fc);
-                mel_filters[k * n_mel + m] = v;
+                float down = (all_freqs[k] - f_pts[m]) / f_diff[m];
+                float up   = (f_pts[m + 2] - all_freqs[k]) / f_diff[m + 1];
+                mel_filters[k * n_mel + m] = std::max(0.0f, std::min(down, up));
             }
         }
     }
 
-    fbank_out.resize((size_t)n_mel * n_frames, 0.0f);
-    const FFTPlan & plan = get_fft_plan();
-    std::vector<float> fft_re(N_FFT_PAD), fft_im(N_FFT_PAD);
-    std::vector<float> power(n_freq);
+    fbank_out.resize((size_t)n_mel * n_frames);
+    const DFTPlan & plan = get_dft_plan();
 
+    #pragma omp parallel for schedule(static)
     for (int32_t fr = 0; fr < n_frames; fr++) {
-        const int32_t start = fr * frame_shift;
-        // Remove DC offset
-        float dc = 0.0f;
-        for (int i = 0; i < frame_len; i++) dc += audio[start + i];
-        dc /= frame_len;
-        // Apply preemphasis (coeff=0.97, matching kaldi default), Hamming window + zero-pad
-        std::fill(fft_re.begin(), fft_re.end(), 0.0f);
-        std::fill(fft_im.begin(), fft_im.end(), 0.0f);
-        fft_re[0] = (audio[start + 0] - dc) * hamming[0];
-        for (int i = 1; i < frame_len; i++) {
-            float cur = (audio[start + i] - dc) - 0.97f * (audio[start + i - 1] - dc);
-            fft_re[i] = cur * hamming[i];
-        }
-        fft_radix2(fft_re.data(), fft_im.data(), plan);
+        const float * frame = padded.data() + fr * frame_shift;
+        float power[N_FREQ];
 
-        // Power spectrum
-        for (int k = 0; k < n_freq; k++) {
-            power[k] = fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
+        // Windowed DFT via pre-baked basis (pure dot products → auto-vectorizes)
+        for (int k = 0; k < N_FREQ; k++) {
+            const float * wc = plan.wcos.data() + (size_t)k * N_FFT;
+            const float * ws = plan.wsin.data() + (size_t)k * N_FFT;
+            float re = 0.0f, im = 0.0f;
+            for (int n = 0; n < N_FFT; n++) {
+                const float s = frame[n];
+                re += s * wc[n];
+                im -= s * ws[n];
+            }
+            power[k] = re * re + im * im;
         }
 
         // Apply mel filters and log
         float * row = fbank_out.data() + (size_t)fr * n_mel;
-        std::fill(row, row + n_mel, 0.0f);
-        for (int k = 0; k < n_freq; k++) {
+        for (int m = 0; m < n_mel; m++) row[m] = 0.0f;
+        for (int k = 0; k < N_FREQ; k++) {
             const float * w = mel_filters.data() + k * n_mel;
             for (int m = 0; m < n_mel; m++) row[m] += w[m] * power[k];
         }
         for (int m = 0; m < n_mel; m++) {
-            row[m] = logf(std::max(row[m], 1e-10f));
+            row[m] = logf(row[m] + 1e-7f);
         }
     }
-    // fbank_out is [n_frames, n_mel] (frame-major)
 }
 
 // LFR: stack m=7 frames with stride n=6, output [T', 560]
@@ -759,12 +806,12 @@ static ggml_cgraph * build_encoder_graph(
     // set as [560, T] → need to upload transposed
     // We'll handle the upload after graph allocation
 
+    // Scale input by sqrt(d_model) before positional encoding (matches Python: x * 512**0.5)
+    inp = ggml_scale(gctx, inp, sqrtf((float)FUN_ASR_ENC_DIM));
+
     // Add SinusoidalPositionEncoder: inp += pos_enc(positions 1..T, depth=560)
-    // Formula: inv_ts[i] = exp(-i * log(10000) / (depth/2-1)), i in [0, depth/2)
-    //          pos_enc = [sin(pos * inv_ts), cos(pos * inv_ts)]
     {
         const int depth = FUN_ASR_ENC_INPUT_DIM; // 560
-        // Build position encoding tensor [560, T] on CPU, then upload
         ggml_tensor * pos_enc_t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, depth, T);
         ggml_set_name(pos_enc_t, "pos_enc");
         ggml_backend_sched_set_tensor_backend(g_ext.sched, pos_enc_t, g_ext.backend_cpu);
@@ -966,17 +1013,17 @@ static ggml_cgraph * build_projector_graph(
     ggml_tensor * enc = ggml_view_2d(gctx, au->enc_out,
         FUN_ASR_ENC_DIM, T, au->enc_out->nb[1], 0);
 
-    // MLP projector: [512→2048] SiLU [2048→1024]
+    // MLP projector: [512→2048] ReLU [2048→1024]
     ggml_tensor * h = ggml_mul_mat(gctx, au->proj_w1, enc);  // [2048, T]
     h = ggml_add(gctx, h, e32(gctx, au->proj_b1));
-    h = ggml_silu(gctx, h);
+    h = ggml_relu(gctx, h);
     h = ggml_mul_mat(gctx, au->proj_w2, h);                  // [1024, T]
     h = ggml_add(gctx, h, e32(gctx, au->proj_b2));
 
-    // Adaptor blocks (2 transformer layers, dim=1024, 4 heads, head_dim=256)
+    // Adaptor blocks (2 transformer layers, dim=1024, 8 heads, head_dim=128)
     const int ada_dim = FUN_ASR_LLM_DIM;     // 1024
-    const int ada_heads = 4;
-    const int ada_head_dim = ada_dim / ada_heads; // 256
+    const int ada_heads = 8;
+    const int ada_head_dim = ada_dim / ada_heads; // 128
 
     for (int i = 0; i < 2; i++) {
         auto & A = au->ada[i];
@@ -1041,6 +1088,7 @@ static ggml_cgraph * build_projector_graph(
 // GPT-2 bytes-to-unicode table: maps each byte value to a UTF-8 encoded unicode codepoint.
 // Printable bytes (33-126, 161-172, 174-255) map to themselves; others map to chr(256+n).
 static std::string g_byte_enc[256];
+static std::unordered_map<std::string, uint8_t> g_byte_dec;
 static bool        g_byte_enc_inited = false;
 
 static void init_byte_enc() {
@@ -1057,6 +1105,7 @@ static void init_byte_enc() {
         else if (cp < 0x800)  { buf[0]=(char)(0xC0|(cp>>6)); buf[1]=(char)(0x80|(cp&0x3F)); len=2; }
         else                  { buf[0]=(char)(0xE0|(cp>>12)); buf[1]=(char)(0x80|((cp>>6)&0x3F)); buf[2]=(char)(0x80|(cp&0x3F)); len=3; }
         g_byte_enc[b] = std::string(buf, len);
+        g_byte_dec[g_byte_enc[b]] = (uint8_t)b;
     }
     g_byte_enc_inited = true;
 }
@@ -1198,25 +1247,96 @@ static std::vector<int32_t> tokenize(const fun_asr_llm & llm, const std::string 
 
 // Decode token IDs to UTF-8 text
 static std::string decode_tokens(const fun_asr_llm & llm, const std::vector<int32_t> & ids) {
+    init_byte_enc();
+
     std::string out;
     for (int32_t id : ids) {
         if (id < 0 || id >= (int32_t)llm.vocab.size()) continue;
         if (id == FUN_ASR_LLM_EOS) break;
         const std::string & tok = llm.vocab[id];
-        // Replace Ġ (0xC4 0xA0) → space, Ċ (0xC4 0x8A) → newline
-        std::string s;
-        for (size_t i = 0; i < tok.size(); ) {
-            uint8_t c = (uint8_t)tok[i];
-            if (c == 0xC4 && i + 1 < tok.size()) {
-                uint8_t c2 = (uint8_t)tok[i+1];
-                if (c2 == 0xA0) { s += ' '; i += 2; continue; }
-                if (c2 == 0x8A) { s += '\n'; i += 2; continue; }
+
+        std::string bytes;
+        for (const std::string & ch : utf8_chars(tok)) {
+            auto it = g_byte_dec.find(ch);
+            if (it != g_byte_dec.end()) {
+                bytes.push_back((char)it->second);
+            } else {
+                bytes += ch;
             }
-            s += tok[i++];
         }
-        out += s;
+        out += bytes;
     }
     return out;
+}
+
+static bool has_repetitive_tail(
+    const std::vector<int32_t> & ids,
+    size_t window = 30,
+    size_t max_unique = 3) {
+    if (ids.size() < window) return false;
+
+    std::unordered_set<int32_t> uniq;
+    const size_t start = ids.size() - window;
+    for (size_t i = start; i < ids.size(); ++i) {
+        uniq.insert(ids[i]);
+        if (uniq.size() > max_unique) return false;
+    }
+    return true;
+}
+
+static bool is_stop_token(int32_t token_id) {
+    return token_id == FUN_ASR_LLM_EOS || token_id == FUN_ASR_LLM_STOP_TOKEN;
+}
+
+static bool has_sentence_punctuation(const std::string & text) {
+    static const char * kMarks[] = {
+        "。", "！", "？", "，", "、", "；", "：",
+        ".", "!", "?", ",", ";", ":"
+    };
+    for (const char * mark : kMarks) {
+        if (text.find(mark) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int32_t sample_from_logits(
+    const std::vector<float> & logits,
+    float temperature,
+    int32_t top_k,
+    std::mt19937 & rng) {
+    if (logits.empty()) return FUN_ASR_LLM_EOS;
+
+    std::vector<int32_t> candidates(logits.size());
+    std::iota(candidates.begin(), candidates.end(), 0);
+
+    const size_t k = std::min<size_t>(
+        std::max<int32_t>(1, top_k),
+        (int32_t)candidates.size());
+    std::partial_sort(
+        candidates.begin(), candidates.begin() + (ptrdiff_t)k, candidates.end(),
+        [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+    candidates.resize(k);
+
+    if (temperature <= 0.0f || k == 1) {
+        return candidates[0];
+    }
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int32_t id : candidates) {
+        max_logit = std::max(max_logit, logits[id]);
+    }
+
+    std::vector<double> weights;
+    weights.reserve(candidates.size());
+    for (int32_t id : candidates) {
+        const double scaled = (double)(logits[id] - max_logit) / (double)temperature;
+        weights.push_back(std::exp(scaled));
+    }
+
+    std::discrete_distribution<int32_t> dist(weights.begin(), weights.end());
+    return candidates[(size_t)dist(rng)];
 }
 
 // ============================================================================
@@ -1586,7 +1706,12 @@ static int32_t run_prefill(
 // Decode single token step
 // ============================================================================
 
-static int32_t run_decode_step(fun_asr_ctx * ctx, int32_t token_id) {
+static int32_t run_decode_step(
+    fun_asr_ctx * ctx,
+    int32_t token_id,
+    float temperature,
+    int32_t top_k,
+    std::mt19937 & rng) {
     const int32_t kv_used = ctx->kv_used;
     const int32_t llm_dim = FUN_ASR_LLM_DIM;
 
@@ -1623,15 +1748,12 @@ static int32_t run_decode_step(fun_asr_ctx * ctx, int32_t token_id) {
     h_flat = ggml_mul(gctx, h_flat, ctx->llm->output_norm);
     ggml_tensor * logits = ggml_mul_mat(gctx, ctx->llm->output_w, h_flat); // [151936]
 
-    // Argmax: use ggml_argmax on [vocab_size, 1]
-    ggml_tensor * logits_2d = ggml_reshape_2d(gctx, logits, FUN_ASR_LLM_VOCAB_SIZE, 1);
-    ggml_tensor * next_tok   = ggml_argmax(gctx, logits_2d); // [1] int32
-
-    // Persistent output: store in a 1D tensor we can read
-    ggml_tensor * out_tok = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
-    ggml_set_name(out_tok, "out_token");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, out_tok, ctx->backend);
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, next_tok, out_tok));
+    // Copy the last-token logits out to host memory so we can apply the same
+    // temperature sampling strategy as the Python reference pipeline.
+    ggml_tensor * out_logits = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, FUN_ASR_LLM_VOCAB_SIZE);
+    ggml_set_name(out_logits, "out_logits");
+    ggml_backend_sched_set_tensor_backend(g_ext.sched, out_logits, ctx->backend);
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, out_logits));
 
     ggml_backend_sched_reset(g_ext.sched);
     if (!ggml_backend_sched_alloc_graph(g_ext.sched, gf)) {
@@ -1646,11 +1768,15 @@ static int32_t run_decode_step(fun_asr_ctx * ctx, int32_t token_id) {
         ggml_free(gctx); return FUN_ASR_LLM_EOS;
     }
 
-    int32_t next_id = FUN_ASR_LLM_EOS;
-    ggml_backend_tensor_get(out_tok, &next_id, 0, sizeof(int32_t));
+    std::vector<float> host_logits(FUN_ASR_LLM_VOCAB_SIZE);
+    ggml_backend_tensor_get(
+        out_logits,
+        host_logits.data(),
+        0,
+        host_logits.size() * sizeof(float));
 
     ggml_free(gctx);
-    return next_id;
+    return sample_from_logits(host_logits, temperature, top_k, rng);
 }
 
 // ============================================================================
@@ -1759,7 +1885,17 @@ fun_asr_ctx * fun_asr_init(const std::string & model_dir, bool use_cuda) {
 // Public API: fun_asr_transcribe
 // ============================================================================
 
-std::string fun_asr_transcribe(fun_asr_ctx * ctx, const std::string & wav_path, int32_t max_tokens) {
+std::string fun_asr_transcribe(
+    fun_asr_ctx * ctx,
+    const std::string & wav_path,
+    int32_t max_tokens,
+    const fun_asr_decode_options * options) {
+    ctx->last_generated_tokens = 0;
+    ctx->last_attempts_used = 0;
+    ctx->last_repetition_retries = 0;
+    ctx->last_punctuation_retries = 0;
+    ctx->last_final_temperature = 0.0f;
+
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&](const char * tag) {
         auto dt = std::chrono::duration<double, std::milli>(
@@ -1776,10 +1912,7 @@ std::string fun_asr_transcribe(fun_asr_ctx * ctx, const std::string & wav_path, 
     }
     elapsed("wav_load");
 
-    // 2. Upscale ×32768
-    for (auto & s : audio) s *= 32768.0f;
-
-    // 3. Compute mel filterbank [n_frames, 80]
+    // 2. Compute mel filterbank [n_frames, 80] (audio is already normalized [-1, 1])
     std::vector<float> fbank;
     int32_t n_frames = 0;
     compute_fbank(audio, fbank, &n_frames);
@@ -1819,6 +1952,17 @@ std::string fun_asr_transcribe(fun_asr_ctx * ctx, const std::string & wav_path, 
     }
     elapsed("projector");
 
+    // 6b. Compute effective audio token count (matches Python's convolutional length formula)
+    // The model was trained with this truncation applied to adaptor output
+    {
+        const int32_t T_mel_valid = (int32_t)(audio.size() / FUN_ASR_FRAME_SHIFT) + 1;
+        const int32_t T_lfr_valid = (T_mel_valid + FUN_ASR_LFR_N - 1) / FUN_ASR_LFR_N;
+        const int32_t olens_1 = 1 + (T_lfr_valid - 3 + 2) / 2;
+        const int32_t target_len = (1 + (olens_1 - 3 + 2) / 2 - 1) / 2 + 1;
+        T_prime = std::min(T_prime, std::max(target_len, 1));
+        fprintf(stderr, "fun_asr: audio_tokens truncated to %d\n", T_prime);
+    }
+
     // Debug: check enc_out and audio_tokens
     {
         std::vector<float> dbg(5);
@@ -1831,8 +1975,8 @@ std::string fun_asr_transcribe(fun_asr_ctx * ctx, const std::string & wav_path, 
     }
 
     // 7. Tokenize prompt
-    const std::string prefix_text = PROMPT_PREFIX;
-    const std::string suffix_text = PROMPT_SUFFIX;
+    const std::string prefix_text = build_prompt_prefix(options);
+    const std::string suffix_text = build_prompt_suffix(options);
 
     std::vector<int32_t> prefix_ids = tokenize(*ctx->llm, prefix_text);
     std::vector<int32_t> suffix_ids = tokenize(*ctx->llm, suffix_text);
@@ -1848,60 +1992,115 @@ std::string fun_asr_transcribe(fun_asr_ctx * ctx, const std::string & wav_path, 
         prefix_ids.size(), suffix_ids.size(), T_prime,
         prefix_ids.size() + T_prime + suffix_ids.size());
 
-    // 8. Prefill (all tokens except the last one)
-    ctx->kv_used = 0;
     const int32_t n_total = (int32_t)(prefix_ids.size() + T_prime + suffix_ids.size());
+    const int32_t seed = options ? options->seed : -1;
+    std::random_device rd;
+    std::mt19937 rng(seed >= 0 ? (uint32_t)seed : rd());
+    std::vector<int32_t> best_tokens;
 
-    if (n_total > 1) {
-        // Build prefill with all tokens except the last suffix token
-        std::vector<int32_t> prefill_prefix = prefix_ids;
-        std::vector<int32_t> prefill_suffix = suffix_ids;
-        if (!prefill_suffix.empty()) {
-            prefill_suffix.pop_back();  // Remove last token for separate first step
+    const float temperature_base = options ? options->temperature_base : 0.0f;
+    const float temperature_step = options ? options->temperature_step : 0.3f;
+    const int32_t top_k = options ? std::max<int32_t>(1, options->top_k) : 50;
+    const int32_t retry_attempts = options ? std::max<int32_t>(1, options->retry_attempts) : 4;
+
+    for (int attempt = 0; attempt < retry_attempts; ++attempt) {
+        const float temperature = temperature_base + temperature_step * attempt;
+        bool aborted = false;
+
+        // 8. Prefill (all tokens except the last one)
+        ctx->kv_used = 0;
+        if (n_total > 1) {
+            std::vector<int32_t> prefill_prefix = prefix_ids;
+            std::vector<int32_t> prefill_suffix = suffix_ids;
+            if (!prefill_suffix.empty()) {
+                prefill_suffix.pop_back();
+            }
+
+            int32_t prefill_len = run_prefill(ctx, prefill_prefix, T_prime, prefill_suffix);
+            if (prefill_len < 0) {
+                fprintf(stderr, "fun_asr: prefill failed\n");
+                return "";
+            }
+            if (attempt == 0) {
+                elapsed("prefill");
+            }
         }
 
-        int32_t prefill_len = run_prefill(ctx, prefill_prefix, T_prime, prefill_suffix);
-        if (prefill_len < 0) {
-            fprintf(stderr, "fun_asr: prefill failed\n");
-            return "";
-        }
-        elapsed("prefill");
-    }
-
-    // 9. First decode step with the last suffix token at its correct position
-    int32_t cur_token = suffix_ids.empty() ? FUN_ASR_LLM_EOS : suffix_ids.back();
-    int32_t first_token = run_decode_step(ctx, cur_token);
-    ctx->kv_used++;
-
-    fprintf(stderr, "fun_asr: first_token=%d\n", first_token);
-    if (first_token == FUN_ASR_LLM_EOS) {
-        elapsed("decode");
-        return "";
-    }
-
-    std::vector<int32_t> out_tokens;
-    out_tokens.push_back(first_token);
-    cur_token = first_token;
-    elapsed("first_step");
-
-    // 10. Autoregressive decode loop
-    for (int step = 1; step < max_tokens; step++) {
-        if (ctx->kv_used >= FUN_ASR_KV_WINDOW) {
-            kv_shift_left(ctx);
-        }
-
-        int32_t next = run_decode_step(ctx, cur_token);
+        // 9. First decode step with the last suffix token at its correct position
+        int32_t cur_token = suffix_ids.empty() ? FUN_ASR_LLM_EOS : suffix_ids.back();
+        int32_t first_token = run_decode_step(
+            ctx, cur_token, temperature, top_k, rng);
         ctx->kv_used++;
 
-        fprintf(stderr, "fun_asr: step=%d token=%d\n", step, next);
-        if (next == FUN_ASR_LLM_EOS) break;
-        out_tokens.push_back(next);
-        cur_token = next;
-    }
-    elapsed("decode");
+        fprintf(stderr, "fun_asr: attempt=%d temperature=%.1f first_token=%d\n",
+            attempt + 1, temperature, first_token);
+        ctx->last_attempts_used = attempt + 1;
+        ctx->last_final_temperature = temperature;
 
-    fprintf(stderr, "fun_asr: generated %zu tokens\n", out_tokens.size());
-    return decode_tokens(*ctx->llm, out_tokens);
+        if (is_stop_token(first_token)) {
+            elapsed("decode");
+            return "";
+        }
+
+        std::vector<int32_t> out_tokens;
+        out_tokens.push_back(first_token);
+        cur_token = first_token;
+        if (attempt == 0) {
+            elapsed("first_step");
+        }
+
+        // 10. Autoregressive decode loop
+        auto t_decode_start = std::chrono::steady_clock::now();
+        for (int step = 1; step < max_tokens; step++) {
+            if (ctx->kv_used >= FUN_ASR_KV_WINDOW) {
+                kv_shift_left(ctx);
+            }
+
+            int32_t next = run_decode_step(
+                ctx, cur_token, temperature, top_k, rng);
+            ctx->kv_used++;
+
+            if (is_stop_token(next)) break;
+            out_tokens.push_back(next);
+            cur_token = next;
+
+            if (has_repetitive_tail(out_tokens)) {
+                fprintf(stderr,
+                    "fun_asr: repetitive tail detected on attempt %d, retrying\n",
+                    attempt + 1);
+                ctx->last_repetition_retries++;
+                aborted = true;
+                break;
+            }
+
+            if (out_tokens.size() == 30 &&
+                !has_sentence_punctuation(decode_tokens(*ctx->llm, out_tokens))) {
+                fprintf(stderr,
+                    "fun_asr: no punctuation in first 30 tokens on attempt %d, retrying\n",
+                    attempt + 1);
+                ctx->last_punctuation_retries++;
+                aborted = true;
+                break;
+            }
+        }
+        {
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_decode_start).count();
+            const int n_tok = (int)out_tokens.size();
+            fprintf(stderr,
+                "fun_asr: attempt=%d decode %d tokens in %.1f ms  (%.1f tok/s)\n",
+                attempt + 1, n_tok, ms, n_tok / std::max(ms / 1000.0, 1e-6));
+        }
+
+        best_tokens = std::move(out_tokens);
+        if (!aborted) {
+            break;
+        }
+    }
+
+    ctx->last_generated_tokens = (int32_t)best_tokens.size();
+    fprintf(stderr, "fun_asr: generated %zu tokens total\n", best_tokens.size());
+    return decode_tokens(*ctx->llm, best_tokens);
 }
 
 // ============================================================================
