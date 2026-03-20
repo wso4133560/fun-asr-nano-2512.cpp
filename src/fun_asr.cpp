@@ -1,5 +1,6 @@
 #include "fun_asr.h"
 #include "gguf.h"
+#include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -66,32 +67,37 @@ static std::string canonical_task_hint(const std::string & raw) {
 }
 
 static std::string build_prompt_suffix(const fun_asr_decode_options * options) {
-    std::string suffix = "<|endofspeech|>\n";
-    if (options) {
-        const std::string language = canonical_language_hint(options->language);
-        const std::string task     = canonical_task_hint(options->task);
-        if (!task.empty()) {
-            suffix += "任务：" + task + "\n";
-        }
-        if (!language.empty()) {
-            suffix += "目标语言：" + language + "\n";
-        }
-        if (!options->context.empty()) {
-            suffix += "上下文信息：" + options->context + "\n";
-        }
-        if (!options->ctc_text.empty()) {
-            suffix += "参考转写：" + options->ctc_text + "\n";
-        }
+    std::string suffix;
+    if (options && !options->ctc_text.empty()) {
+        suffix += "\n参考转写：" + options->ctc_text;
     }
-    suffix += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    suffix += "\n请直接输出最终转写文本，不要添加解释。<|im_end|>\n<|im_start|>assistant\n";
     return suffix;
 }
 
 static std::string build_prompt_prefix(const fun_asr_decode_options * options) {
-    (void) options;
-    return
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-        "<|im_start|>user\n<|startofspeech|>";
+    std::string prefix =
+        "<|im_start|>system\n"
+        "You are a helpful assistant for multilingual speech recognition."
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "请根据音频内容完成高质量语音转写，只输出最终文本。\n";
+
+    if (options) {
+        const std::string language = canonical_language_hint(options->language);
+        const std::string task     = canonical_task_hint(options->task);
+        if (!language.empty()) {
+            prefix += "目标语言：" + language + "\n";
+        }
+        if (options && !options->context.empty()) {
+            prefix += "上下文信息：" + options->context + "\n";
+        }
+        if (!task.empty()) {
+            prefix += "任务：" + task + "\n";
+        }
+    }
+    prefix += "请结合音频与参考文本纠正专有名词、数字和标点。\n";
+    return prefix;
 }
 
 // ============================================================================
@@ -188,6 +194,10 @@ struct fun_asr_llm {
 struct fun_asr_ctx_ext {
     ggml_backend_t       backend_cpu = nullptr;
     ggml_backend_sched_t sched       = nullptr;
+    ggml_gallocr_t       galloc_dec  = nullptr;  // decode graph allocator
+    ggml_gallocr_t       galloc_enc  = nullptr;  // encoder graph allocator
+    ggml_gallocr_t       galloc_proj = nullptr;  // projector graph allocator
+    ggml_gallocr_t       galloc_pf   = nullptr;  // prefill graph allocator
 };
 
 // We keep a parallel ext struct keyed to ctx pointer
@@ -745,40 +755,27 @@ static ggml_tensor * e32(ggml_context * gctx, ggml_tensor * t) {
 static ggml_tensor * build_fsmn(
     ggml_context * gctx,
     ggml_tensor  * x,       // [dim, T]
-    ggml_tensor  * fsmn_w,  // [11, 1, dim]
+    ggml_tensor  * fsmn_w,  // [11, 1, dim] F16
     int32_t        dim,
     int32_t        T)
 {
-    // Pad x along time dimension (dim 1): 5 zeros on each side → [dim, T+10]
-    ggml_tensor * x_pad = ggml_pad_ext(gctx, x, 0, 0, 5, 5, 0, 0, 0, 0); // [dim, T+10]
+    // Depthwise 1D conv via conv_2d_dw: each feature dim is a channel
+    // Transpose x [dim, T] → [T, dim] contiguous, then reshape to [T, 1, dim, 1]
+    ggml_tensor * xt = ggml_cont(gctx, ggml_transpose(gctx, x)); // [T, dim] contiguous
+    ggml_tensor * x4 = ggml_reshape_4d(gctx, xt, T, 1, dim, 1);  // [W=T, H=1, C=dim, N=1]
 
-    // Transpose fsmn_w [11, 1, dim] → contiguous [dim, 11]
-    // permute(2, 0, 1, 3): new ne = [dim, 11, 1, 1]
-    ggml_tensor * fw = ggml_cont(gctx, ggml_permute(gctx, fsmn_w, 2, 0, 1, 3));
-    fw = ggml_reshape_2d(gctx, fw, dim, 11); // [dim, 11] contiguous
+    // Kernel [11, 1, dim] → [KW=11, KH=1, 1, C=dim]
+    ggml_tensor * fw = ggml_reshape_4d(gctx, fsmn_w, 11, 1, 1, dim);
 
-    // Convert weight to F32 (it's F16 in the audio model)
-    fw = ggml_cast(gctx, fw, GGML_TYPE_F32); // [dim, 11] F32
+    ggml_tensor * conv = ggml_conv_2d_dw(gctx, fw, x4,
+        /*s0=*/1, /*s1=*/1, /*p0=*/5, /*p1=*/0, /*d0=*/1, /*d1=*/1);
+    // conv: [T, 1, dim, 1]
 
-    ggml_tensor * acc = nullptr;
-    for (int k = 0; k < 11; k++) {
-        // Weight for position k: column k of fw → [dim] F32
-        ggml_tensor * w_k = ggml_view_1d(gctx, fw, dim,
-            (size_t)k * fw->nb[1]); // [dim] F32
-        // Reshape to [dim, 1] for broadcasting
-        w_k = ggml_reshape_2d(gctx, w_k, dim, 1);
+    // Reshape to [T, dim], transpose back to [dim, T]
+    conv = ggml_cont(gctx, ggml_transpose(gctx,
+        ggml_reshape_2d(gctx, conv, T, dim))); // [dim, T]
 
-        // Input slice at position k: x_pad[:,k:k+T] → [dim, T]
-        ggml_tensor * x_k = ggml_view_2d(gctx, x_pad, dim, T,
-            x_pad->nb[1], (size_t)k * x_pad->nb[1]);
-
-        // Elementwise multiply with broadcast: [dim, T] * [dim, 1] → [dim, T]
-        ggml_tensor * contrib = ggml_mul(gctx, x_k, w_k);
-
-        acc = (acc == nullptr) ? contrib : ggml_add(gctx, acc, contrib);
-    }
-    // FSMN internal residual: conv(x) + x  (matches forward_fsmn: x += inputs)
-    return ggml_add(gctx, acc, x);
+    return ggml_add(gctx, conv, x);
 }
 
 // ============================================================================
@@ -798,7 +795,6 @@ static ggml_cgraph * build_encoder_graph(
     // Upload LFR input [560, T'] in GGML column-major
     ggml_tensor * inp = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, FUN_ASR_ENC_INPUT_DIM, T);
     ggml_set_name(inp, "enc_input");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, inp, ctx->backend);
 
     // Transpose lfr_data from [T', 560] to [560, T'] before set (done after alloc)
     // We'll use ggml_transpose in the graph
@@ -814,7 +810,6 @@ static ggml_cgraph * build_encoder_graph(
         const int depth = FUN_ASR_ENC_INPUT_DIM; // 560
         ggml_tensor * pos_enc_t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, depth, T);
         ggml_set_name(pos_enc_t, "pos_enc");
-        ggml_backend_sched_set_tensor_backend(g_ext.sched, pos_enc_t, g_ext.backend_cpu);
         inp = ggml_add(gctx, inp, pos_enc_t);
     }
 
@@ -1401,24 +1396,15 @@ static ggml_tensor * build_qwen3_layer(
     ggml_tensor * V = ggml_mul_mat(gctx, L.attn_v, xn); // [1024, n_tokens]
 
     // QK-Norm: per-head RMSNorm on Q then K (applied before RoPE)
-    // Q: [2048, n_tokens] → reshape [128, 16, n_tokens] → rms_norm → scale → reshape back
     Q = ggml_reshape_3d(gctx, Q, head_dim, n_q_heads, n_tokens);
     Q = ggml_rms_norm(gctx, Q, FUN_ASR_LLM_NORM_EPS);
-    Q = ggml_mul(gctx, Q, L.attn_q_norm);  // broadcast [128] with [128, 16, n_tokens]
-    Q = ggml_cont(gctx, Q);
-    Q = ggml_reshape_2d(gctx, Q, n_q_heads * head_dim, n_tokens); // [2048, n_tokens]
+    Q = ggml_mul(gctx, Q, L.attn_q_norm);
 
     K = ggml_reshape_3d(gctx, K, head_dim, n_kv_heads, n_tokens);
     K = ggml_rms_norm(gctx, K, FUN_ASR_LLM_NORM_EPS);
-    K = ggml_mul(gctx, K, L.attn_k_norm);  // broadcast [128] with [128, 8, n_tokens]
-    K = ggml_cont(gctx, K);
-    K = ggml_reshape_2d(gctx, K, kv_dim, n_tokens);  // [1024, n_tokens]
+    K = ggml_mul(gctx, K, L.attn_k_norm);
 
-    // Reshape Q, K for RoPE: [head_dim, n_heads, n_tokens]
-    Q = ggml_reshape_3d(gctx, Q, head_dim, n_q_heads, n_tokens);
-    K = ggml_reshape_3d(gctx, K, head_dim, n_kv_heads, n_tokens);
-
-    // RoPE (NEOX mode=2, freq_base=1e6, head_dim=128)
+    // RoPE (NEOX mode=2, freq_base=1e6) — Q,K already [head_dim, n_heads, n_tokens]
     Q = ggml_rope_ext(gctx, Q, positions, nullptr,
         head_dim, GGML_ROPE_TYPE_NEOX, 0,
         FUN_ASR_LLM_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -1452,12 +1438,12 @@ static ggml_tensor * build_qwen3_layer(
         (size_t)layer_idx * ctx->v_cache->nb[2]);
 
     // Flash attention (GQA: 16 Q heads, 8 KV heads)
-    ggml_tensor * q3 = ggml_cont(gctx, ggml_permute(gctx,
-        ggml_reshape_3d(gctx, Q, head_dim, n_q_heads, n_tokens), 0, 2, 1, 3));
-    ggml_tensor * k3 = ggml_cont(gctx, ggml_permute(gctx,
-        ggml_reshape_3d(gctx, k_full, head_dim, n_kv_heads, n_kv), 0, 2, 1, 3));
-    ggml_tensor * v3 = ggml_cont(gctx, ggml_permute(gctx,
-        ggml_reshape_3d(gctx, v_full, head_dim, n_kv_heads, n_kv), 0, 2, 1, 3));
+    ggml_tensor * q3 = ggml_permute(gctx,
+        ggml_reshape_3d(gctx, Q, head_dim, n_q_heads, n_tokens), 0, 2, 1, 3);
+    ggml_tensor * k3 = ggml_permute(gctx,
+        ggml_reshape_3d(gctx, k_full, head_dim, n_kv_heads, n_kv), 0, 2, 1, 3);
+    ggml_tensor * v3 = ggml_permute(gctx,
+        ggml_reshape_3d(gctx, v_full, head_dim, n_kv_heads, n_kv), 0, 2, 1, 3);
 
     const float scale = 1.0f / sqrtf((float)head_dim);
     ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask, scale, 0.0f, 0.0f);
@@ -1503,7 +1489,6 @@ static bool run_graph(fun_asr_ctx * ctx, ggml_context * gctx, ggml_cgraph * gf) 
 // ============================================================================
 
 static bool run_encoder(fun_asr_ctx * ctx, const float * lfr_data, int32_t T) {
-    // Build graph
     const size_t meta_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false);
     std::vector<uint8_t> meta_buf(meta_size);
     ggml_init_params ip = { meta_size, meta_buf.data(), true };
@@ -1512,32 +1497,27 @@ static bool run_encoder(fun_asr_ctx * ctx, const float * lfr_data, int32_t T) {
 
     ggml_cgraph * gf = build_encoder_graph(ctx, gctx, lfr_data, T);
 
-    ggml_backend_sched_reset(g_ext.sched);
-    if (!ggml_backend_sched_alloc_graph(g_ext.sched, gf)) {
+    if (!ggml_gallocr_alloc_graph(g_ext.galloc_enc, gf)) {
         fprintf(stderr, "fun_asr: encoder alloc_graph failed\n");
         ggml_free(gctx); return false;
     }
 
-    // Upload input: lfr_data is [T, 560] row-major
-    // GGML tensor [560, T]: ne[0]=560 is contiguous — same layout as row-major [T, 560]
     ggml_tensor * inp = ggml_graph_get_tensor(gf, "enc_input");
     if (inp) {
         ggml_backend_tensor_set(inp, lfr_data, 0,
             (size_t)FUN_ASR_ENC_INPUT_DIM * T * sizeof(float));
     }
 
-    // Upload sinusoidal position encoding [560, T]
     ggml_tensor * pos_enc_t = ggml_graph_get_tensor(gf, "pos_enc");
     if (pos_enc_t) {
-        const int depth = FUN_ASR_ENC_INPUT_DIM; // 560
+        const int depth = FUN_ASR_ENC_INPUT_DIM;
         std::vector<float> pe((size_t)depth * T);
         const float log_ts_inc = logf(10000.0f) / (depth / 2 - 1);
         for (int t = 0; t < T; t++) {
-            float pos = (float)(t + 1); // positions 1..T
+            float pos = (float)(t + 1);
             for (int i = 0; i < depth / 2; i++) {
                 float inv_ts = expf(-(float)i * log_ts_inc);
                 float angle = pos * inv_ts;
-                // GGML tensor [depth, T]: element [d, t] is at index d + t*depth
                 pe[i + t * depth]               = sinf(angle);
                 pe[(i + depth/2) + t * depth]  = cosf(angle);
             }
@@ -1546,7 +1526,7 @@ static bool run_encoder(fun_asr_ctx * ctx, const float * lfr_data, int32_t T) {
             (size_t)depth * T * sizeof(float));
     }
 
-    bool ok = (ggml_backend_sched_graph_compute(g_ext.sched, gf) == GGML_STATUS_SUCCESS);
+    bool ok = (ggml_backend_graph_compute(ctx->backend, gf) == GGML_STATUS_SUCCESS);
     if (!ok) fprintf(stderr, "fun_asr: encoder graph_compute failed\n");
 
     ggml_free(gctx);
@@ -1565,7 +1545,10 @@ static bool run_projector(fun_asr_ctx * ctx, int32_t T) {
     if (!gctx) return false;
 
     ggml_cgraph * gf = build_projector_graph(ctx, gctx, T);
-    bool ok = run_graph(ctx, gctx, gf);
+    if (!ggml_gallocr_alloc_graph(g_ext.galloc_proj, gf)) {
+        ggml_free(gctx); return false;
+    }
+    bool ok = (ggml_backend_graph_compute(ctx->backend, gf) == GGML_STATUS_SUCCESS);
     ggml_free(gctx);
     return ok;
 }
@@ -1591,9 +1574,29 @@ static int32_t run_prefill(
         return -1;
     }
 
-    // Build the full prefill embedding on CPU, then upload
-    // Prefix: token embedding lookup via CPU dequant (avoid building graph for embd lookup)
-    // Instead, build a GGML graph that assembles everything
+    // Dequantize prefix/suffix embeddings on CPU
+    const ggml_tensor * embd_w = ctx->llm->tok_embd;
+    const size_t row_size = ggml_row_size(embd_w->type, llm_dim);
+    const ggml_type_traits * traits = ggml_get_type_traits(embd_w->type);
+
+    std::vector<float> combined_emb((size_t)n_total * llm_dim);
+    {
+        std::vector<uint8_t> qrow(row_size);
+        // Prefix embeddings
+        for (int i = 0; i < n_prefix; i++) {
+            ggml_backend_tensor_get(embd_w, qrow.data(), (size_t)prefix_ids[i] * row_size, row_size);
+            traits->to_float(qrow.data(), combined_emb.data() + (size_t)i * llm_dim, llm_dim);
+        }
+        // Audio tokens: copy from GPU
+        ggml_backend_tensor_get(ctx->audio->audio_tokens,
+            combined_emb.data() + (size_t)n_prefix * llm_dim,
+            0, (size_t)T_audio * llm_dim * sizeof(float));
+        // Suffix embeddings
+        for (int i = 0; i < n_suffix; i++) {
+            ggml_backend_tensor_get(embd_w, qrow.data(), (size_t)suffix_ids[i] * row_size, row_size);
+            traits->to_float(qrow.data(), combined_emb.data() + (size_t)(n_prefix + T_audio + i) * llm_dim, llm_dim);
+        }
+    }
 
     const size_t meta_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false);
     std::vector<uint8_t> meta_buf(meta_size);
@@ -1603,84 +1606,40 @@ static int32_t run_prefill(
 
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, 8192, false);
 
-    // Build combined input embedding tensor as graph operations
-    // prefix_ids_t: [n_prefix] int32
-    ggml_tensor * pref_ids_t = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_prefix);
-    ggml_set_name(pref_ids_t, "prefix_ids");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, pref_ids_t, ctx->backend);
+    // Combined embedding input [1024, n_total] F32
+    ggml_tensor * combined_t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, llm_dim, n_total);
+    ggml_set_name(combined_t, "combined_emb");
 
-    ggml_tensor * suf_ids_t = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_suffix);
-    ggml_set_name(suf_ids_t, "suffix_ids");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, suf_ids_t, ctx->backend);
-
-    // Positions: [n_total] int32
     ggml_tensor * pos_t = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_total);
     ggml_set_name(pos_t, "positions");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, pos_t, ctx->backend);
 
-    // Causal mask: [n_total, n_total] F16
     ggml_tensor * mask_t = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_total, n_total);
     ggml_set_name(mask_t, "causal_mask");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, mask_t, ctx->backend);
-
-    // Prefix embeddings
-    ggml_tensor * pref_emb = ggml_get_rows(gctx,
-        ctx->llm->tok_embd, pref_ids_t);  // [1024, n_prefix]
-
-    // Audio tokens view [1024, T_audio]
-    ggml_tensor * audio_view = ggml_view_2d(gctx, ctx->audio->audio_tokens,
-        llm_dim, T_audio, ctx->audio->audio_tokens->nb[1], 0);
-
-    // Suffix embeddings
-    ggml_tensor * suf_emb = ggml_get_rows(gctx,
-        ctx->llm->tok_embd, suf_ids_t);  // [1024, n_suffix]
-
-    // Persistent output buffer for assembled embeddings: [1024, n_total]
-    // Use a transient tensor allocated by sched
-    ggml_tensor * combined = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, llm_dim, n_total);
-    ggml_set_name(combined, "combined_emb");
-
-    // Copy parts into combined
-    ggml_tensor * c_pref = ggml_view_2d(gctx, combined, llm_dim, n_prefix,
-        combined->nb[1], 0);
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, pref_emb, c_pref));
-
-    ggml_tensor * c_audio = ggml_view_2d(gctx, combined, llm_dim, T_audio,
-        combined->nb[1], (size_t)n_prefix * combined->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, audio_view, c_audio));
-
-    ggml_tensor * c_suf = ggml_view_2d(gctx, combined, llm_dim, n_suffix,
-        combined->nb[1], (size_t)(n_prefix + T_audio) * combined->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, suf_emb, c_suf));
 
     // Run 28 Qwen3 layers
-    ggml_tensor * h = combined;
+    ggml_tensor * h = combined_t;
     for (int i = 0; i < FUN_ASR_LLM_LAYERS; i++) {
         h = build_qwen3_layer(ctx, gctx, gf, h, pos_t, i, n_total, 0, mask_t);
     }
 
-    // Final norm + logits for last token (to get first decode token)
+    // Final norm (no logits needed from prefill)
     ggml_tensor * h_last = ggml_view_1d(gctx, h, llm_dim,
         (size_t)(n_total - 1) * h->nb[1]);
     h_last = ggml_rms_norm(gctx, h_last, FUN_ASR_LLM_NORM_EPS);
-    h_last = ggml_mul(gctx, h_last, ctx->llm->output_norm);
-    // We don't need logits from prefill since we decode the last suffix token
+    ggml_build_forward_expand(gf, ggml_mul(gctx, h_last, ctx->llm->output_norm));
 
-    ggml_backend_sched_reset(g_ext.sched);
-    if (!ggml_backend_sched_alloc_graph(g_ext.sched, gf)) {
+    if (!ggml_gallocr_alloc_graph(g_ext.galloc_pf, gf)) {
         ggml_free(gctx); return -1;
     }
 
-    // Upload prefix/suffix ids
-    ggml_backend_tensor_set(pref_ids_t, prefix_ids.data(), 0, n_prefix * sizeof(int32_t));
-    ggml_backend_tensor_set(suf_ids_t,  suffix_ids.data(), 0, n_suffix * sizeof(int32_t));
+    // Upload inputs
+    ggml_backend_tensor_set(combined_t, combined_emb.data(), 0,
+        (size_t)n_total * llm_dim * sizeof(float));
 
-    // Upload positions [0, 1, ..., n_total-1]
     std::vector<int32_t> pos_data(n_total);
     for (int i = 0; i < n_total; i++) pos_data[i] = i;
     ggml_backend_tensor_set(pos_t, pos_data.data(), 0, n_total * sizeof(int32_t));
 
-    // Upload causal mask: -inf for future positions
     {
         std::vector<ggml_fp16_t> mask_data((size_t)n_total * n_total);
         for (int q = 0; q < n_total; q++) {
@@ -1693,7 +1652,7 @@ static int32_t run_prefill(
             (size_t)n_total * n_total * sizeof(ggml_fp16_t));
     }
 
-    if (ggml_backend_sched_graph_compute(g_ext.sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_free(gctx); return -1;
     }
 
@@ -1714,6 +1673,7 @@ static int32_t run_decode_step(
     std::mt19937 & rng) {
     const int32_t kv_used = ctx->kv_used;
     const int32_t llm_dim = FUN_ASR_LLM_DIM;
+    const bool greedy = (temperature <= 0.0f);
 
     const size_t meta_size = ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(2048, false);
     std::vector<uint8_t> meta_buf(meta_size);
@@ -1723,60 +1683,68 @@ static int32_t run_decode_step(
 
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, 2048, false);
 
-    // Input token ID: [1] int32
-    ggml_tensor * tok_t = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
-    ggml_set_name(tok_t, "token_id");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, tok_t, ctx->backend);
+    // Embedding input: pre-dequantized on CPU, uploaded to GPU
+    ggml_tensor * emb_t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, llm_dim);
+    ggml_set_name(emb_t, "emb_input");
 
-    // Position: [1] int32
     ggml_tensor * pos_t = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
     ggml_set_name(pos_t, "position");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, pos_t, ctx->backend);
 
-    // Token embedding: [1024, 1]
-    ggml_tensor * emb = ggml_get_rows(gctx, ctx->llm->tok_embd, tok_t);
-
-    // Run 28 layers (n_tokens=1, kv_offset=kv_used)
-    ggml_tensor * h = emb;
+    ggml_tensor * h = ggml_reshape_2d(gctx, emb_t, llm_dim, 1);
     for (int i = 0; i < FUN_ASR_LLM_LAYERS; i++) {
         h = build_qwen3_layer(ctx, gctx, gf, h, pos_t, i, 1, kv_used, nullptr);
     }
 
-    // Final norm + logits
     ggml_tensor * h_flat = ggml_reshape_1d(gctx, h, llm_dim);
     h_flat = ggml_rms_norm(gctx, h_flat, FUN_ASR_LLM_NORM_EPS);
     h_flat = ggml_mul(gctx, h_flat, ctx->llm->output_norm);
-    ggml_tensor * logits = ggml_mul_mat(gctx, ctx->llm->output_w, h_flat); // [151936]
+    ggml_tensor * logits = ggml_mul_mat(gctx, ctx->llm->output_w, h_flat);
 
-    // Copy the last-token logits out to host memory so we can apply the same
-    // temperature sampling strategy as the Python reference pipeline.
-    ggml_tensor * out_logits = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, FUN_ASR_LLM_VOCAB_SIZE);
-    ggml_set_name(out_logits, "out_logits");
-    ggml_backend_sched_set_tensor_backend(g_ext.sched, out_logits, ctx->backend);
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, out_logits));
+    ggml_tensor * out_t = nullptr;
+    if (greedy) {
+        ggml_tensor * logits_2d = ggml_reshape_2d(gctx, logits, FUN_ASR_LLM_VOCAB_SIZE, 1);
+        out_t = ggml_argmax(gctx, logits_2d);
+        ggml_set_name(out_t, "argmax_out");
+        ggml_build_forward_expand(gf, out_t);
+    } else {
+        out_t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, FUN_ASR_LLM_VOCAB_SIZE);
+        ggml_set_name(out_t, "out_logits");
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, out_t));
+    }
 
-    ggml_backend_sched_reset(g_ext.sched);
-    if (!ggml_backend_sched_alloc_graph(g_ext.sched, gf)) {
+    // Use lightweight graph allocator + direct CUDA compute (bypass scheduler)
+    if (!ggml_gallocr_alloc_graph(g_ext.galloc_dec, gf)) {
         ggml_free(gctx); return FUN_ASR_LLM_EOS;
     }
 
-    // Set inputs
-    ggml_backend_tensor_set(tok_t, &token_id, 0, sizeof(int32_t));
+    // Dequantize embedding row on CPU, upload to GPU
+    {
+        const ggml_tensor * embd_w = ctx->llm->tok_embd;
+        const size_t row_size = ggml_row_size(embd_w->type, llm_dim);
+        std::vector<uint8_t> qrow(row_size);
+        ggml_backend_tensor_get(embd_w, qrow.data(), (size_t)token_id * row_size, row_size);
+        float emb_f32[FUN_ASR_LLM_DIM];
+        const ggml_type_traits * traits = ggml_get_type_traits(embd_w->type);
+        traits->to_float(qrow.data(), emb_f32, llm_dim);
+        ggml_backend_tensor_set(emb_t, emb_f32, 0, llm_dim * sizeof(float));
+    }
     ggml_backend_tensor_set(pos_t, &kv_used, 0, sizeof(int32_t));
 
-    if (ggml_backend_sched_graph_compute(g_ext.sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_free(gctx); return FUN_ASR_LLM_EOS;
     }
 
-    std::vector<float> host_logits(FUN_ASR_LLM_VOCAB_SIZE);
-    ggml_backend_tensor_get(
-        out_logits,
-        host_logits.data(),
-        0,
-        host_logits.size() * sizeof(float));
+    int32_t result;
+    if (greedy) {
+        ggml_backend_tensor_get(out_t, &result, 0, sizeof(int32_t));
+    } else {
+        std::vector<float> host_logits(FUN_ASR_LLM_VOCAB_SIZE);
+        ggml_backend_tensor_get(out_t, host_logits.data(), 0, host_logits.size() * sizeof(float));
+        result = sample_from_logits(host_logits, temperature, top_k, rng);
+    }
 
     ggml_free(gctx);
-    return sample_from_logits(host_logits, temperature, top_k, rng);
+    return result;
 }
 
 // ============================================================================
@@ -1877,6 +1845,91 @@ fun_asr_ctx * fun_asr_init(const std::string & model_dir, bool use_cuda) {
         }
     }
 
+    // Initialize decode graph allocator (bypasses scheduler for faster decode)
+    {
+        g_ext.galloc_dec = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(ctx->backend));
+
+        // Build a worst-case decode graph to reserve buffer space
+        const size_t msz = ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(2048, false);
+        std::vector<uint8_t> mbuf(msz);
+        ggml_init_params mp = { msz, mbuf.data(), true };
+        ggml_context * mgctx = ggml_init(mp);
+        ggml_cgraph * mgf = ggml_new_graph_custom(mgctx, 2048, false);
+
+        ggml_tensor * memb = ggml_new_tensor_1d(mgctx, GGML_TYPE_F32, FUN_ASR_LLM_DIM);
+        ggml_tensor * mpos = ggml_new_tensor_1d(mgctx, GGML_TYPE_I32, 1);
+        ggml_tensor * mh = ggml_reshape_2d(mgctx, memb, FUN_ASR_LLM_DIM, 1);
+        for (int i = 0; i < FUN_ASR_LLM_LAYERS; i++) {
+            mh = build_qwen3_layer(ctx, mgctx, mgf, mh, mpos, i, 1,
+                FUN_ASR_KV_WINDOW - 1, nullptr);
+        }
+        mh = ggml_reshape_1d(mgctx, mh, FUN_ASR_LLM_DIM);
+        mh = ggml_rms_norm(mgctx, mh, FUN_ASR_LLM_NORM_EPS);
+        mh = ggml_mul(mgctx, mh, ctx->llm->output_norm);
+        ggml_tensor * mlogits = ggml_mul_mat(mgctx, ctx->llm->output_w, mh);
+        ggml_tensor * mlogits_2d = ggml_reshape_2d(mgctx, mlogits, FUN_ASR_LLM_VOCAB_SIZE, 1);
+        ggml_build_forward_expand(mgf, ggml_argmax(mgctx, mlogits_2d));
+        // Also account for sampling path (needs larger output buffer)
+        ggml_tensor * mout = ggml_new_tensor_1d(mgctx, GGML_TYPE_F32, FUN_ASR_LLM_VOCAB_SIZE);
+        ggml_build_forward_expand(mgf, ggml_cpy(mgctx, mlogits, mout));
+
+        ggml_gallocr_reserve(g_ext.galloc_dec, mgf);
+        ggml_free(mgctx);
+    }
+
+    // Initialize encoder graph allocator
+    {
+        g_ext.galloc_enc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(ctx->backend));
+        const size_t msz = ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false);
+        std::vector<uint8_t> mbuf(msz);
+        ggml_init_params mp = { msz, mbuf.data(), true };
+        ggml_context * mgctx = ggml_init(mp);
+        float dummy[FUN_ASR_ENC_INPUT_DIM * FUN_ASR_MAX_ENC_SEQ] = {};
+        ggml_cgraph * mgf = build_encoder_graph(ctx, mgctx, dummy, FUN_ASR_MAX_ENC_SEQ);
+        ggml_gallocr_reserve(g_ext.galloc_enc, mgf);
+        ggml_free(mgctx);
+    }
+
+    // Initialize projector graph allocator
+    {
+        g_ext.galloc_proj = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(ctx->backend));
+        const size_t msz = ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(2048, false);
+        std::vector<uint8_t> mbuf(msz);
+        ggml_init_params mp = { msz, mbuf.data(), true };
+        ggml_context * mgctx = ggml_init(mp);
+        ggml_cgraph * mgf = build_projector_graph(ctx, mgctx, FUN_ASR_MAX_ENC_SEQ);
+        ggml_gallocr_reserve(g_ext.galloc_proj, mgf);
+        ggml_free(mgctx);
+    }
+
+    // Initialize prefill graph allocator (worst case: full KV window)
+    {
+        g_ext.galloc_pf = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(ctx->backend));
+        const int max_pf = FUN_ASR_KV_WINDOW;
+        const size_t msz = ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false);
+        std::vector<uint8_t> mbuf(msz);
+        ggml_init_params mp = { msz, mbuf.data(), true };
+        ggml_context * mgctx = ggml_init(mp);
+        ggml_cgraph * mgf = ggml_new_graph_custom(mgctx, 8192, false);
+        ggml_tensor * mc = ggml_new_tensor_2d(mgctx, GGML_TYPE_F32, FUN_ASR_LLM_DIM, max_pf);
+        ggml_tensor * mp_t = ggml_new_tensor_1d(mgctx, GGML_TYPE_I32, max_pf);
+        ggml_tensor * mm = ggml_new_tensor_2d(mgctx, GGML_TYPE_F16, max_pf, max_pf);
+        ggml_tensor * mh = mc;
+        for (int i = 0; i < FUN_ASR_LLM_LAYERS; i++) {
+            mh = build_qwen3_layer(ctx, mgctx, mgf, mh, mp_t, i, max_pf, 0, mm);
+        }
+        ggml_tensor * ml = ggml_view_1d(mgctx, mh, FUN_ASR_LLM_DIM,
+            (size_t)(max_pf - 1) * mh->nb[1]);
+        ml = ggml_rms_norm(mgctx, ml, FUN_ASR_LLM_NORM_EPS);
+        ggml_build_forward_expand(mgf, ggml_mul(mgctx, ml, ctx->llm->output_norm));
+        ggml_gallocr_reserve(g_ext.galloc_pf, mgf);
+        ggml_free(mgctx);
+    }
+
     fprintf(stderr, "fun_asr: initialized successfully\n");
     return ctx;
 }
@@ -1934,8 +1987,6 @@ std::string fun_asr_transcribe(
         T_prime = MAX_ENC_SEQ;
         fprintf(stderr, "fun_asr: truncating encoder input to %d frames\n", MAX_ENC_SEQ);
     }
-    fprintf(stderr, "fun_asr: T'=%d\n", T_prime);
-    fprintf(stderr, "fun_asr: lfr[0,:5] = %.6f %.6f %.6f %.6f %.6f\n", lfr[0], lfr[1], lfr[2], lfr[3], lfr[4]);
     elapsed("lfr");
 
     // 5. SenseVoice encoder → enc_out [512, T']
@@ -1960,18 +2011,6 @@ std::string fun_asr_transcribe(
         const int32_t olens_1 = 1 + (T_lfr_valid - 3 + 2) / 2;
         const int32_t target_len = (1 + (olens_1 - 3 + 2) / 2 - 1) / 2 + 1;
         T_prime = std::min(T_prime, std::max(target_len, 1));
-        fprintf(stderr, "fun_asr: audio_tokens truncated to %d\n", T_prime);
-    }
-
-    // Debug: check enc_out and audio_tokens
-    {
-        std::vector<float> dbg(5);
-        ggml_backend_tensor_get(ctx->audio->enc_out, dbg.data(), 0, 5 * sizeof(float));
-        fprintf(stderr, "fun_asr: enc_out[0..4] = %.6f %.6f %.6f %.6f %.6f\n",
-            dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
-        ggml_backend_tensor_get(ctx->audio->audio_tokens, dbg.data(), 0, 5 * sizeof(float));
-        fprintf(stderr, "fun_asr: audio_tokens[0..4] = %.4f %.4f %.4f %.4f %.4f\n",
-            dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
     }
 
     // 7. Tokenize prompt
@@ -1981,16 +2020,10 @@ std::string fun_asr_transcribe(
     std::vector<int32_t> prefix_ids = tokenize(*ctx->llm, prefix_text);
     std::vector<int32_t> suffix_ids = tokenize(*ctx->llm, suffix_text);
 
-    // Debug: dump prefix/suffix token IDs
-    fprintf(stderr, "fun_asr: prefix_ids =");
-    for (int id : prefix_ids) fprintf(stderr, " %d", id);
-    fprintf(stderr, "\nfun_asr: suffix_ids =");
-    for (int id : suffix_ids) fprintf(stderr, " %d", id);
-    fprintf(stderr, "\n");
-
-    fprintf(stderr, "fun_asr: prefix=%zu suffix=%zu audio=%d total_prefill=%zu\n",
-        prefix_ids.size(), suffix_ids.size(), T_prime,
-        prefix_ids.size() + T_prime + suffix_ids.size());
+    const int32_t n_audio = T_prime;
+    fprintf(stderr, "fun_asr: prefill prefix=%zu audio=%d suffix=%zu total=%zu\n",
+        prefix_ids.size(), n_audio, suffix_ids.size(),
+        prefix_ids.size() + n_audio + suffix_ids.size());
 
     const int32_t n_total = (int32_t)(prefix_ids.size() + T_prime + suffix_ids.size());
     const int32_t seed = options ? options->seed : -1;
@@ -2032,8 +2065,10 @@ std::string fun_asr_transcribe(
             ctx, cur_token, temperature, top_k, rng);
         ctx->kv_used++;
 
-        fprintf(stderr, "fun_asr: attempt=%d temperature=%.1f first_token=%d\n",
-            attempt + 1, temperature, first_token);
+        if (attempt > 0) {
+            fprintf(stderr, "fun_asr: retry attempt=%d temperature=%.1f\n",
+                attempt + 1, temperature);
+        }
         ctx->last_attempts_used = attempt + 1;
         ctx->last_final_temperature = temperature;
 
@@ -2045,9 +2080,7 @@ std::string fun_asr_transcribe(
         std::vector<int32_t> out_tokens;
         out_tokens.push_back(first_token);
         cur_token = first_token;
-        if (attempt == 0) {
-            elapsed("first_step");
-        }
+        elapsed("first_decode");
 
         // 10. Autoregressive decode loop
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -2087,19 +2120,16 @@ std::string fun_asr_transcribe(
             double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_decode_start).count();
             const int n_tok = (int)out_tokens.size();
-            fprintf(stderr,
-                "fun_asr: attempt=%d decode %d tokens in %.1f ms  (%.1f tok/s)\n",
-                attempt + 1, n_tok, ms, n_tok / std::max(ms / 1000.0, 1e-6));
+            const double tps = n_tok / std::max(ms / 1000.0, 1e-6);
+            fprintf(stderr, "fun_asr: decode %d tokens in %.1f ms (%.1f tok/s)\n",
+                n_tok, ms, tps);
         }
 
         best_tokens = std::move(out_tokens);
-        if (!aborted) {
-            break;
-        }
+        if (!aborted) break;
     }
 
     ctx->last_generated_tokens = (int32_t)best_tokens.size();
-    fprintf(stderr, "fun_asr: generated %zu tokens total\n", best_tokens.size());
     return decode_tokens(*ctx->llm, best_tokens);
 }
 
@@ -2110,6 +2140,10 @@ std::string fun_asr_transcribe(
 void fun_asr_free(fun_asr_ctx * ctx) {
     if (!ctx) return;
 
+    if (g_ext.galloc_pf)   { ggml_gallocr_free(g_ext.galloc_pf);   g_ext.galloc_pf = nullptr; }
+    if (g_ext.galloc_proj) { ggml_gallocr_free(g_ext.galloc_proj); g_ext.galloc_proj = nullptr; }
+    if (g_ext.galloc_enc)  { ggml_gallocr_free(g_ext.galloc_enc);  g_ext.galloc_enc = nullptr; }
+    if (g_ext.galloc_dec)  { ggml_gallocr_free(g_ext.galloc_dec);  g_ext.galloc_dec = nullptr; }
     if (g_ext.sched) {
         ggml_backend_sched_free(g_ext.sched);
         g_ext.sched = nullptr;

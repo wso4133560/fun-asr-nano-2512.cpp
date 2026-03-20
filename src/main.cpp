@@ -188,8 +188,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Transcription failed or returned empty result\n");
     }
 
-    fprintf(stderr, "\n[timing] init=%.3fs  transcribe=%.3fs\n",
-            init_ms / 1000.0, transcribe_ms / 1000.0);
+    const int n_gen = ctx->last_generated_tokens;
+    const double tok_per_sec = n_gen > 0 ? n_gen / (transcribe_ms / 1000.0) : 0.0;
+    fprintf(stderr, "\n[timing] init=%.3fs  transcribe=%.3fs  tokens=%d  tok/s=%.1f\n",
+            init_ms / 1000.0, transcribe_ms / 1000.0, n_gen, tok_per_sec);
 
     fun_asr_free(ctx);
     return result.empty() ? 1 : 0;
